@@ -32,13 +32,13 @@ SIGMA_TAU = 26.0
 # Rocket component for games whose players are growing far faster than a
 # diurnal swing, and whose rank is worse than their player count.
 GROWTH_LONG_BASE = 0.012
-GROWTH_LONG_WEIGHT = 1.3
+GROWTH_LONG_WEIGHT = 1.8
 GROWTH_SHORT_BASE = 0.10
-GROWTH_SHORT_WEIGHT = 1.1
-ROCKET_SCALE = 2.2
-ROCKET_CAP = 0.62
-ROCKET_GAP_DIV = 35.0
-ROCKET_SIGMA0 = 5.5
+GROWTH_SHORT_WEIGHT = 1.5
+ROCKET_SCALE = 3.4
+ROCKET_CAP = 0.72
+ROCKET_GAP_DIV = 28.0
+ROCKET_SIGMA0 = 4.2
 # Share of each place left for games that are not on the chart yet.
 NEW_BASE = 0.02
 NEW_SLOPE = 0.0016
@@ -185,16 +185,32 @@ def survival(uid, created, now, horizon):
 
 
 def rocket_weight(feat):
-    """Probability of a jump toward the top, from shrunk player-growth."""
+    """Probability of a jump toward the top, from shrunk player-growth.
+
+    One-step player counts swing with the time of day, so only a 24-hour
+    change or a short move past the extreme tail counts. A game already
+    ranked far above its player count is not treated as a climber.
+    """
     signal = max(feat["log_long"] - GROWTH_LONG_BASE, 0.0) * GROWTH_LONG_WEIGHT
     if feat["log_short"] > GROWTH_SHORT_BASE:
         signal = max(signal, (feat["log_short"] - GROWTH_SHORT_BASE) * GROWTH_SHORT_WEIGHT)
     weight = min(ROCKET_CAP, signal * ROCKET_SCALE)
-    if feat["gap"] > 10.0 and feat["rank"] >= 10.0:
-        weight = min(ROCKET_CAP, weight * (1.0 + min(feat["gap"], 40.0) / ROCKET_GAP_DIV))
-    if feat["rank"] <= 5.0:
-        weight *= 0.25
+    if feat["gap"] > 8.0 and feat["rank"] >= 8.0:
+        weight = min(ROCKET_CAP, weight * (1.0 + min(feat["gap"], 45.0) / ROCKET_GAP_DIV))
+    if feat["gap"] < -15.0:
+        weight *= 0.2
+    if feat["rank"] <= 4.0:
+        weight *= 0.3
     return weight
+
+
+def rocket_target(feat, weight):
+    """Rank the surge is heading toward. Underranked growers aim at the top."""
+    if weight >= 0.15 and feat["gap"] > 8.0:
+        return max(1.5, min(5.5, feat["rank"] * 0.13))
+    if weight >= 0.12:
+        return max(3.0, min(12.0, feat["rank"] * 0.15))
+    return max(1.0, feat["rank"] * 0.5)
 
 
 def forecast(task, snaps):
@@ -206,10 +222,7 @@ def forecast(task, snaps):
     for uid in candidates:
         feat = features[uid]
         weight = rocket_weight(feat)
-        if feat["gap"] > 10.0:
-            rocket_mean = max(1.0, feat["rank"] * 0.20)
-        else:
-            rocket_mean = max(1.0, feat["rank"] * min(0.75, 0.45))
+        rocket_mean = rocket_target(feat, weight)
         stale = (
             feat["hours_on"] > STALE_HOURS
             and feat["vel"] > -0.04
@@ -243,17 +256,31 @@ def forecast(task, snaps):
                 densities.append(None)
                 continue
             drift = feat["vel"] * VEL_TAU * (1.0 - math.exp(-horizon / VEL_TAU))
+            # A lagging rank (players up, place down) must not drag a rocket
+            # the wrong way. Keep only upward velocity for those games.
+            if weight > 0.2 and drift > 0.0:
+                drift = 0.0
             mean = feat["rank"] + drift
             if stale:
                 mean += STALE_DRIFT * horizon
+            # The #1 slot turns over much faster than the rest of the top 5,
+            # so persistence for the leader is centered between #1 and #2.
+            persist_center = feat["rank"]
+            if feat["rank"] <= 1.0:
+                persist_center = 1.8
+            elif feat["rank"] <= 2.0:
+                persist_center = 1.45
             sigma = max(0.7, sigma_h * volatility)
-            rocket_sigma = ROCKET_SIGMA0 + 0.04 * horizon
+            rocket_sigma = max(3.0, ROCKET_SIGMA0 + 0.035 * horizon)
+            # The jump is available immediately. Waiting for persistence to
+            # fade kept surges at ~0.01 through the whole window.
+            persist_w = persist * (1.0 - 0.9 * weight)
             row = [0.0] * places
             for place in range(1, places + 1):
-                density = persist * gaussian(place, feat["rank"], PERSIST_SIGMA)
-                density += (1.0 - persist) * (1.0 - weight) * gaussian(place, mean, sigma)
-                if weight > 0.01:
-                    density += (1.0 - persist) * weight * gaussian(place, rocket_mean, rocket_sigma)
+                density = persist_w * gaussian(place, persist_center, PERSIST_SIGMA)
+                density += (1.0 - persist_w) * (1.0 - weight) * gaussian(place, mean, sigma)
+                if weight > 0.02:
+                    density += (1.0 - persist_w) * weight * gaussian(place, rocket_mean, rocket_sigma)
                 row[place - 1] = alive * density
             densities.append(row)
         for place_index in range(places):
@@ -280,6 +307,10 @@ def forecast(task, snaps):
     # that are not in the history (the newcomer share), up to 100 rows.
     probabilities = []
     for place_index, rows in enumerate(by_place):
+        # Drop dust before the fill. A sub-floor row used to count as "named"
+        # and then disappear at rounding, putting that game back in the
+        # residual pool and thinning the share left for true newcomers.
+        rows = [(uid, probability) for uid, probability in rows if probability >= MIN_P]
         rows.sort(key=lambda item: (-item[1], item[0]))
         mass = sum(probability for _uid, probability in rows)
         if mass > 0.97:
@@ -287,7 +318,7 @@ def forecast(task, snaps):
             rows = [(uid, probability * scale) for uid, probability in rows]
             mass = 0.97
         named = {uid for uid, _probability in rows}
-        tiny = 1.2e-4
+        tiny = MIN_P
         for uid, _feat, _weight, _mean, _stale, _vol in prepared:
             if len(rows) >= 100:
                 break
@@ -312,10 +343,10 @@ def forecast(task, snaps):
     def order_key(uid):
         total = mass.get(uid, 0.0)
         if total <= 1e-6:
-            return (50.0, features[uid]["rank"], uid)
-        # Unallocated personal mass is treated as a miss outside the top 10.
-        outside = (1.0 - min(total, 1.0)) * 16.0
-        return (expected[uid] + outside, features[uid]["rank"], uid)
+            return (50.0, 0.0, uid)
+        # Conditional expected place. Mass breaks ties toward games we
+        # actually put probability on.
+        return (expected[uid] / total, -total, uid)
 
     top = sorted(candidates, key=order_key)[:places]
     if len(top) < places:
