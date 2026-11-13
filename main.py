@@ -1,570 +1,625 @@
-#!/usr/bin/env python3
-"""Forecast Roblox's Up-and-Coming top 10 over the scored window.
+# Up-and-Coming mixture forecaster.
+# One table is scored on every hour of the window, so the program averages
+# the hourly seat distributions. Each hour blends a sticky seat, a shrunk
+# rank slope whose spread grows and then levels off, and a jump for titles
+# whose audience is rising much faster than the time of day. Unnamed mass
+# is what the history does not claim. A known publish instant drops a title
+# once it is older than four weeks.
+# Invoked as python3 main.py. Standard library only. No randomness.
 
-One forecast is graded at every hour, so the file is the mixture of the
-hourly distributions rather than the chart at a single horizon. Each hour
-mixes three pieces:
+import json as chartjson
+import math as chartmath
+import os as chartos
+from datetime import datetime as ChartClock
 
-* persistence: the latest rank, with the #1 seat pulled toward #2 because
-  that seat turns over faster than the rest of the top five;
-* diffusion: a shrunk rank velocity whose width grows and then saturates;
-* a surge: games whose players are growing far faster than a time-of-day
-  swing, aimed at the top when their rank still lags their player count.
+CHART_IN = chartos.environ.get("MAKEFUN_INPUT_DIR", "/input")
+CHART_OUT = chartos.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
-Probability that does not belong to any game in the history is left unnamed.
-Every game on the latest chart is named, so that leftover is shared by games
-that are not in the history. A game with a known publish time is removed once
-it is older than 28 days.
-
-When a snapshot carries games/v1 details, cumulative visits and favorites can
-only raise the 24-hour growth signal, and a like-ratio far from 0.90 nudges
-the diffused rank. The practice archive sends none of those, so they do not
-move the practice forecast.
-
-Reads $MAKEFUN_INPUT_DIR or /input. Writes $MAKEFUN_OUTPUT_DIR or /output.
-Python 3.13, standard library only. Deterministic.
-"""
-
-import json
-import math
-import os
-from datetime import datetime
-
-INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-
-# Persistence half-life of the "chart has not moved" component, in hours.
-PERSIST_TAU = 30.0
-PERSIST_SIGMA = 1.25
-# Rank-velocity memory. The slope is shrunk toward zero and the integrated
-# drift saturates, because consecutive rank changes only weakly persist.
-VEL_HALF_LIFE = 16.0
-VEL_SHRINK = 3.5
-VEL_TAU = 18.0
-# Diffusion width grows quickly, then saturates. Late hours stay uncertain
-# without flattening the whole chart into one uniform.
-SIGMA0 = 0.8
-SIGMA_MAX = 4.5
-SIGMA_TAU = 26.0
-# Surge component. One-step player counts swing with the hour of the day, so
-# only a ~24 hour change, or a short move past the extreme tail, counts.
-GROWTH_LONG_BASE = 0.012
-GROWTH_LONG_WEIGHT = 1.8
-GROWTH_SHORT_BASE = 0.10
-GROWTH_SHORT_WEIGHT = 1.5
-ROCKET_SCALE = 3.4
-ROCKET_CAP = 0.72
-ROCKET_GAP_DIV = 28.0
-ROCKET_SIGMA0 = 4.2
-# Share of each place left for games that are not on the chart yet.
-NEW_BASE = 0.02
-NEW_SLOPE = 0.0016
-NEW_POWER = 1.35
-NEW_CAP = 0.34
-# Games that have sat on the chart for days without climbing drift downward.
-STALE_HOURS = 140.0
-STALE_DRIFT = 0.05
-# Up-and-Coming only lists experiences published in the last 28 days.
-MAX_AGE_HOURS = 28.0 * 24.0
-PLACES = 10
-MIN_P = 1e-4
-MAX_ROWS = 100
-# Like-ratio of 0.90 is treated as neutral. Farther away moves the diffused
-# rank by this many ranks per unit of ratio, and only with enough votes.
-LIKE_NEUTRAL = 0.90
-LIKE_SCALE = 8.0
-LIKE_MIN_VOTES = 50.0
+# Sticky component: half-life and gaussian width, both in hours / seats.
+STICK_HALFLIFE = 30.0
+STICK_WIDTH = 1.25
+# Slope of seat versus time. Prior strength shrinks a short sample toward 0.
+SLOPE_HALFLIFE = 16.0
+SLOPE_PRIOR = 3.5
+SLOPE_MEMORY = 18.0
+# Diffusive width starts narrow and saturates. Late hours stay unsure
+# without washing the whole list into one flat distribution.
+WIDTH_FLOOR = 0.8
+WIDTH_SPAN = 4.5
+WIDTH_HALFLIFE = 26.0
+# Audience growth. A single step moves with the hour, so only a day-scale
+# change, or a burst past the extreme tail, is allowed to launch a jump.
+LONG_GROWTH_FLOOR = 0.012
+LONG_GROWTH_GAIN = 1.8
+BURST_GROWTH_FLOOR = 0.10
+BURST_GROWTH_GAIN = 1.5
+JUMP_GAIN = 3.4
+JUMP_LIMIT = 0.72
+GAP_DIVISOR = 28.0
+JUMP_WIDTH0 = 4.2
+# Share of a seat reserved for titles that have not appeared in the history.
+FRESH_FLOOR = 0.02
+FRESH_SLOPE = 0.0016
+FRESH_POWER = 1.35
+FRESH_LIMIT = 0.34
+# Long-resident titles that are not climbing slide slowly down the list.
+AGED_AFTER = 140.0
+AGED_SLIDE = 0.05
+LISTING_LIFE = 28.0 * 24.0
+SEAT_COUNT = 10
+FLOOR_P = 1e-4
+ROW_CAP = 100
+# Like-ratio near 0.90 is neutral. A large sample can shift the diffused seat.
+NEUTRAL_LIKE = 0.90
+LIKE_PULL = 8.0
+LIKE_VOTES = 50.0
 
 
-def parse_hours(stamp):
-    """ISO-8601 UTC timestamp as hours since the Unix epoch."""
-    return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() / 3600.0
+def as_hours(text):
+    """UTC timestamp text, in hours since 1970-01-01."""
+    cleaned = text.replace("Z", "+00:00")
+    instant = ChartClock.fromisoformat(cleaned)
+    return instant.timestamp() / 3600.0
 
 
-def load_inputs():
-    """task.json plus every snapshot in history.ndjson, oldest first."""
-    with open(os.path.join(INPUT_DIR, "task.json"), encoding="utf-8") as handle:
-        task = json.load(handle)
-    snaps = []
-    with open(os.path.join(INPUT_DIR, "history.ndjson"), encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                snaps.append(json.loads(line))
-    if not snaps:
-        raise SystemExit("history.ndjson is empty")
-    return task, snaps
+def read_bundle():
+    """task.json together with history.ndjson, oldest snapshot first."""
+    task_path = chartos.path.join(CHART_IN, "task.json")
+    history_path = chartos.path.join(CHART_IN, "history.ndjson")
+    with open(task_path, encoding="utf-8") as task_file:
+        task = chartjson.load(task_file)
+    snapshots = []
+    with open(history_path, encoding="utf-8") as history_file:
+        for raw in history_file:
+            raw = raw.strip()
+            if raw:
+                snapshots.append(chartjson.loads(raw))
+    if len(snapshots) == 0:
+        raise SystemExit("history.ndjson has no snapshots")
+    return task, snapshots
 
 
-def weighted_slope(points, half_life):
-    """Exponentially weighted slope of y on t. Returns (slope, weight sum)."""
-    if len(points) < 2:
-        return 0.0, 0.0
-    t_last = points[-1][0]
-    weight_sum = 0.0
-    sum_x = 0.0
-    sum_y = 0.0
-    sum_xx = 0.0
-    sum_xy = 0.0
-    for stamp, value in points:
-        weight = 0.5 ** ((t_last - stamp) / half_life)
-        weight_sum += weight
-        sum_x += weight * stamp
-        sum_y += weight * value
-        sum_xx += weight * stamp * stamp
-        sum_xy += weight * stamp * value
-    variance = sum_xx - sum_x * sum_x / weight_sum
-    if variance < 1e-6:
-        return 0.0, weight_sum
-    covariance = sum_xy - sum_x * sum_y / weight_sum
-    return covariance / variance, weight_sum
+def slope_fit(samples, halflife):
+    """Weighted least-squares slope of value on time. Also returns weight mass."""
+    if not samples or len(samples) == 1:
+        nothing = (0.0, 0.0)
+        return nothing
+    newest = samples[-1][0]
+    mass = 0.0
+    mom_t = 0.0
+    mom_y = 0.0
+    mom_tt = 0.0
+    mom_ty = 0.0
+    for moment, value in samples:
+        age = newest - moment
+        decay = chartmath.pow(0.5, age / halflife)
+        mass += decay
+        mom_t += decay * moment
+        mom_y += decay * value
+        mom_tt += decay * moment * moment
+        mom_ty += decay * moment * value
+    spread = mom_tt - (mom_t * mom_t) / mass
+    if spread <= 1e-6:
+        flat = (0.0, mass)
+        return flat
+    co_move = mom_ty - (mom_t * mom_y) / mass
+    rate = co_move / spread
+    return (rate, mass)
 
 
-def _is_number(value):
-    """True for a real JSON number. Booleans are ints and do not count."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+def numeric(value):
+    """JSON numbers count. Booleans are ints and do not."""
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float))
 
 
-def _detail_map(snap):
-    """universe id -> details dict, for snapshots that carried games/v1."""
-    details = snap.get("details") or {}
-    if not isinstance(details, dict):
-        return {}
-    mapped = {}
-    for key, detail in details.items():
-        if not isinstance(detail, dict):
-            continue
-        try:
-            mapped[int(key)] = detail
-        except (TypeError, ValueError):
-            continue
-    return mapped
+def coerce_uid(token):
+    try:
+        return int(token), True
+    except Exception:
+        return 0, False
 
 
-def _optional_float(detail, key):
-    value = detail.get(key) if isinstance(detail, dict) else None
-    if not _is_number(value):
-        return 0.0
+def detail_table(snapshot):
+    """universe id to games/v1 object, for snapshots that carried details."""
+    blob = snapshot.get("details") or {}
+    found = {}
+    if not isinstance(blob, dict):
+        return found
+    for key, body in blob.items():
+        if isinstance(body, dict):
+            parsed, ok = coerce_uid(key)
+            if ok:
+                found[parsed] = body
+    return found
+
+
+def detail_number(info, field):
+    value = info.get(field) if isinstance(info, dict) else None
+    if not numeric(value):
+        missing = 0.0
+        return missing
     return float(value)
 
 
-def _vote_pair(row, detail):
-    """(up, down) from the chart row, else from details, else missing."""
-    up = row.get("up_votes")
-    down = row.get("down_votes")
-    if _is_number(up) and _is_number(down):
+def vote_counts(entry, info):
+    """Up and down votes from the chart row, else from details."""
+    up = entry.get("up_votes")
+    down = entry.get("down_votes")
+    if numeric(up) and numeric(down):
         return float(up), float(down)
-    if isinstance(detail, dict):
-        up = detail.get("up_votes")
-        down = detail.get("down_votes")
-        if _is_number(up) and _is_number(down):
+    if isinstance(info, dict):
+        up = info.get("up_votes")
+        down = info.get("down_votes")
+        if numeric(up) and numeric(down):
             return float(up), float(down)
     return None
 
 
-def _like_nudge(row, detail):
-    """Ranks to add to the diffused mean. Negative is a better place.
+def approval_shift(entry, info):
+    """Seats to add to the diffused mean. Negative is a better place.
 
-    Missing votes, which is the whole practice archive, contribute 0. A
-    like-ratio above 0.90 on at least 50 votes pulls the game up a fraction
-    of a rank; a weak ratio pushes it down.
+    No votes means no shift. The practice archive omits votes entirely.
     """
-    pair = _vote_pair(row, detail)
+    pair = vote_counts(entry, info)
     if pair is None:
-        return 0.0
+        neutral = 0.0
+        return neutral
     up, down = pair
-    total = up + down
-    if total < LIKE_MIN_VOTES:
-        return 0.0
-    return (LIKE_NEUTRAL - up / total) * LIKE_SCALE
+    votes = up + down
+    if votes < LIKE_VOTES:
+        neutral = 0.0
+        return neutral
+    ratio = up / votes
+    return (NEUTRAL_LIKE - ratio) * LIKE_PULL
 
 
-def series_and_created(snaps):
-    """Per-game history plus publish times.
+def build_tracks(snapshots):
+    """Per-title history plus publish instants.
 
-    Each observation is (time, rank, players, player-rank, visits, favorites,
-    like-nudge). Visits, favorites and the nudge stay 0 unless that snapshot
-    names them. `created` is set only when a snapshot carries games/v1
-    details: the practice archive has none, and the final hourly recorder does.
+    A point is (when, seat, audience, audience-seat, visits, favorites, nudge).
+    Visits, favorites and the nudge stay zero unless the snapshot names them.
     """
-    times = [parse_hours(snap["at"]) for snap in snaps]
-    series = {}
-    created = {}
-    for snap, stamp in zip(snaps, times):
-        rows = snap.get("up_and_coming") or []
-        details = _detail_map(snap)
-        by_players = sorted(range(len(rows)), key=lambda i: -(rows[i].get("playing") or 0))
-        player_rank = {}
-        for index, row_index in enumerate(by_players):
-            player_rank[rows[row_index]["universe_id"]] = index + 1
-        for row in rows:
-            uid = row["universe_id"]
-            detail = details.get(uid, {})
-            series.setdefault(uid, []).append(
-                (
-                    stamp,
-                    float(row["rank"]),
-                    float(row.get("playing") or 0.0),
-                    float(player_rank[uid]),
-                    _optional_float(detail, "visits"),
-                    _optional_float(detail, "favorites"),
-                    _like_nudge(row, detail),
-                )
+    moments = [as_hours(shot["at"]) for shot in snapshots]
+    tracks = {}
+    born = {}
+    for shot, moment in zip(snapshots, moments):
+        rows = shot.get("up_and_coming") or []
+        info = detail_table(shot)
+        order = sorted(range(len(rows)), key=lambda i: -(rows[i].get("playing") or 0))
+        by_audience = {}
+        for place, row_index in enumerate(order):
+            by_audience[rows[row_index]["universe_id"]] = place + 1
+        for entry in rows:
+            uid = entry["universe_id"]
+            extra = info.get(uid, {})
+            audience = entry.get("playing")
+            if not numeric(audience):
+                audience = 0.0
+            point = (
+                moment,
+                float(entry["rank"]),
+                float(audience),
+                float(by_audience[uid]),
+                detail_number(extra, "visits"),
+                detail_number(extra, "favorites"),
+                approval_shift(entry, extra),
             )
-            if uid not in created and detail.get("created"):
+            tracks.setdefault(uid, []).append(point)
+            if uid not in born and extra.get("created"):
                 try:
-                    created[uid] = parse_hours(detail["created"])
-                except (TypeError, ValueError):
-                    continue
-    return times, series, created
+                    born[uid] = as_hours(extra["created"])
+                except Exception:
+                    born.pop(uid, None)
+    return moments, tracks, born
 
 
-def _log_change(obs, index):
-    """(long growth or None, short growth) for observation field `index`.
+def growth_pair(track, field):
+    """(day-scale log growth or None, last-step log growth) for one field.
 
-    The long window is the observation nearest 24 hours back, kept only when
-    it falls between 8 and 40 hours ago. Short growth is the last step.
-    Unknown fields (no positive readings) return (None, 0).
+    The day-scale reading is the sample nearest a day earlier, and only if
+    that sample sits between eight and forty hours back.
     """
-    last = obs[-1]
-    if last[index] <= 0.0:
-        return None, 0.0
-    log_short = 0.0
-    if len(obs) >= 2 and obs[-2][index] > 0.0:
-        delta = last[0] - obs[-2][0]
-        if delta > 0.25:
-            log_short = (math.log(last[index] + 1.0) - math.log(obs[-2][index] + 1.0)) / delta
-    best = None
-    target = last[0] - 24.0
-    for obs_row in obs[:-1]:
-        if obs_row[index] <= 0.0:
-            continue
-        if best is None or abs(obs_row[0] - target) < abs(best[0] - target):
-            best = obs_row
-    log_long = None
-    if best is not None and 8.0 < (last[0] - best[0]) < 40.0:
-        log_long = (math.log(last[index] + 1.0) - math.log(best[index] + 1.0)) / (last[0] - best[0])
-    return log_long, log_short
+    latest = track[-1]
+    if latest[field] <= 0.0:
+        unknown = (None, 0.0)
+        return unknown
+    step = 0.0
+    if len(track) >= 2 and track[-2][field] > 0.0:
+        gap = latest[0] - track[-2][0]
+        if gap > 0.25:
+            step = chartmath.log(latest[field] + 1.0) - chartmath.log(track[-2][field] + 1.0)
+            step = step / gap
+    aim = latest[0] - 24.0
+    chosen = None
+    for earlier in track[:-1]:
+        if earlier[field] <= 0.0:
+            pass
+        elif chosen is None or abs(earlier[0] - aim) < abs(chosen[0] - aim):
+            chosen = earlier
+    day = None
+    if chosen is not None:
+        span = latest[0] - chosen[0]
+        if span > 8.0 and span < 40.0:
+            day = chartmath.log(latest[field] + 1.0) - chartmath.log(chosen[field] + 1.0)
+            day = day / span
+    return day, step
 
 
-def _log_player_growth(obs):
-    """Player log-growth. Visits and favorites can only raise the long rate.
-
-    Both are cumulative, so a 24-hour change is not a time-of-day swing. The
-    practice archive sends neither, and this then returns the player signal
-    alone.
-    """
-    player_long, player_short = _log_change(obs, 2)
-    log_long = 0.0 if player_long is None else player_long
+def audience_signal(track):
+    """Player log-growth. Visits and favorites may only lift the day-scale rate."""
+    day, step = growth_pair(track, 2)
+    lifted = 0.0 if day is None else day
     for field in (4, 5):
-        extra, _short = _log_change(obs, field)
-        if extra is not None:
-            log_long = max(log_long, extra)
-    return player_short, log_long
+        extra, _ignored = growth_pair(track, field)
+        if extra is not None and extra > lifted:
+            lifted = extra
+    return step, lifted
 
 
-def game_features(series, now):
-    """Features for games still on the latest chart."""
-    features = {}
-    for uid, obs in series.items():
-        last = obs[-1]
-        if abs(last[0] - now) > 1e-3:
-            continue
-        slope, weight = weighted_slope(
-            [(row[0], row[1]) for row in obs],
-            VEL_HALF_LIFE,
-        )
-        shrink = weight / (weight + VEL_SHRINK)
-        log_short, log_long = _log_player_growth(obs)
-        features[uid] = {
-            "rank": last[1],
-            "vel": slope * shrink,
-            "log_short": log_short,
-            "log_long": log_long,
-            "gap": last[1] - last[3],
-            "hours_on": now - obs[0][0],
-            "n": len(obs),
-            "like_nudge": last[6],
-        }
-    return features
+def features_now(tracks, now):
+    """Titles still present on the newest chart."""
+    found = {}
+    for uid, track in tracks.items():
+        latest = track[-1]
+        if abs(latest[0] - now) > 1e-3:
+            pass
+        else:
+            pairs = [(point[0], point[1]) for point in track]
+            rate, mass = slope_fit(pairs, SLOPE_HALFLIFE)
+            shrink = mass / (mass + SLOPE_PRIOR)
+            step, lifted = audience_signal(track)
+            found[uid] = {
+                "seat": latest[1],
+                "pace": rate * shrink,
+                "burst": step,
+                "day": lifted,
+                "lag": latest[1] - latest[3],
+                "resident": now - track[0][0],
+                "seen": len(track),
+                "nudge": latest[6],
+            }
+    return found
 
 
-def gaussian(place, mean, sigma):
-    """Density of a normal rank at an integer place. Far tails are zero."""
-    z = (place - mean) / sigma
-    if abs(z) > 8.0:
-        return 0.0
-    return math.exp(-0.5 * z * z) / sigma
+def jump_mass(feat):
+    """Weight of a leap toward the top, from shrunk audience growth.
 
-
-def survival(uid, created, now, horizon):
-    """1 while the game can still be listed `horizon` hours after `now`."""
-    born = created.get(uid)
-    if born is None:
-        return 1.0
-    remaining = born + MAX_AGE_HOURS - now
-    if horizon > remaining:
-        return 0.0
-    if horizon > remaining - 12.0:
-        return 0.4
-    return 1.0
-
-
-def rocket_weight(feat):
-    """Mixture weight of a jump toward the top, from shrunk player growth.
-
-    A game already ranked far above its player count is not treated as a
-    climber: the surge there is popularity the chart has already priced in.
+    A title already seated far above its audience is not treated as a climber.
     """
-    signal = max(feat["log_long"] - GROWTH_LONG_BASE, 0.0) * GROWTH_LONG_WEIGHT
-    if feat["log_short"] > GROWTH_SHORT_BASE:
-        signal = max(signal, (feat["log_short"] - GROWTH_SHORT_BASE) * GROWTH_SHORT_WEIGHT)
-    weight = min(ROCKET_CAP, signal * ROCKET_SCALE)
-    if feat["gap"] > 8.0 and feat["rank"] >= 8.0:
-        weight = min(ROCKET_CAP, weight * (1.0 + min(feat["gap"], 45.0) / ROCKET_GAP_DIV))
-    if feat["gap"] < -15.0:
-        weight *= 0.2
-    if feat["rank"] <= 4.0:
-        weight *= 0.3
+    signal = max(feat["day"] - LONG_GROWTH_FLOOR, 0.0) * LONG_GROWTH_GAIN
+    if feat["burst"] > BURST_GROWTH_FLOOR:
+        burst = (feat["burst"] - BURST_GROWTH_FLOOR) * BURST_GROWTH_GAIN
+        signal = max(signal, burst)
+    weight = min(JUMP_LIMIT, signal * JUMP_GAIN)
+    if feat["lag"] > 8.0 and feat["seat"] >= 8.0:
+        boost = 1.0 + min(feat["lag"], 45.0) / GAP_DIVISOR
+        weight = min(JUMP_LIMIT, weight * boost)
+    if feat["lag"] < -15.0:
+        weight = weight * 0.2
+    if feat["seat"] <= 4.0:
+        weight = weight * 0.3
     return weight
 
 
-def rocket_target(feat, weight):
-    """Rank the surge is heading toward. Underranked growers aim at the top."""
-    if weight >= 0.15 and feat["gap"] > 8.0:
-        return max(1.5, min(5.5, feat["rank"] * 0.13))
+def jump_seat(feat, weight):
+    """Seat the surge is aimed at. Underranked growers point at the top."""
+    if weight >= 0.15 and feat["lag"] > 8.0:
+        aimed = max(1.5, min(5.5, feat["seat"] * 0.13))
+        return aimed
     if weight >= 0.12:
-        return max(3.0, min(12.0, feat["rank"] * 0.15))
-    return max(1.0, feat["rank"] * 0.5)
+        aimed = max(3.0, min(12.0, feat["seat"] * 0.15))
+        return aimed
+    aimed = max(1.0, feat["seat"] * 0.5)
+    return aimed
 
 
-def _volatility(observations):
-    if observations <= 2:
-        return 1.45
-    if observations <= 4:
-        return 1.2
-    return 1.0
+def noise_scale(seen):
+    if seen <= 2:
+        broad = 1.45
+        return broad
+    if seen <= 4:
+        mid = 1.2
+        return mid
+    calm = 1.0
+    return calm
 
 
-def _is_stale(feat):
-    return (
-        feat["hours_on"] > STALE_HOURS
-        and feat["vel"] > -0.04
-        and feat["log_long"] < 0.01
-        and feat["log_short"] < 0.04
-    )
+def sitting_too_long(feat):
+    old = feat["resident"] > AGED_AFTER
+    flat_pace = feat["pace"] > -0.04
+    quiet_day = feat["day"] < 0.01
+    quiet_step = feat["burst"] < 0.04
+    return old and flat_pace and quiet_day and quiet_step
 
 
-def prepare_candidates(features):
-    """Latest-chart games with surge weight, target rank, staleness, noise."""
-    prepared = []
+def pack_games(features):
+    """Newest-chart titles with jump weight, aim, staleness and noise."""
+    packed = []
     for uid in features:
         feat = features[uid]
-        weight = rocket_weight(feat)
-        prepared.append(
-            (uid, feat, weight, rocket_target(feat, weight), _is_stale(feat), _volatility(feat["n"]))
+        weight = jump_mass(feat)
+        packed.append(
+            (uid, feat, weight, jump_seat(feat, weight), sitting_too_long(feat), noise_scale(feat["seen"]))
         )
-    return prepared
+    return packed
 
 
-def _persist_center(rank):
-    """Sticky rank. The #1 seat turns over faster than ranks 3-5, so the
-    leader and the game under it are centered between those two seats.
+def sticky_seat(seat):
+    """Sticky center. Seat 1 turns over faster than seats 3-5."""
+    if seat <= 1.0:
+        between = 1.8
+        return between
+    if seat <= 2.0:
+        between = 1.45
+        return between
+    return seat
+
+
+def still_listed(uid, born, now, ahead):
+    """1 while the title can remain listed `ahead` hours after `now`."""
+    opened = born.get(uid)
+    if opened is None:
+        full = 1.0
+        return full
+    left = opened + LISTING_LIFE - now
+    if ahead > left:
+        gone = 0.0
+        return gone
+    if ahead > left - 12.0:
+        fading = 0.4
+        return fading
+    full = 1.0
+    return full
+
+
+def bell(seat, center, width):
+    """Normal density at an integer seat. Distant tails are dropped."""
+    offset = (seat - center) / width
+    if offset > 8.0 or offset < -8.0:
+        return 0.0 * width
+    body = chartmath.exp(-0.5 * offset * offset)
+    return body / width
+
+
+def hour_rows(packed, born, now, ahead, seats):
+    """Densities for one hour, plus the fresh-title share held out of them.
+
+    The jump is mixed in at once. A pace that makes the seat number worse
+    is ignored for a jumper, because that lag is what the audience surge
+    is supposed to close. The vote nudge moves only the diffused center.
     """
-    if rank <= 1.0:
-        return 1.8
-    if rank <= 2.0:
-        return 1.45
-    return rank
-
-
-def densities_at_horizon(prepared, created, now, horizon, places):
-    """Place densities for one hour, and the newcomer share held out of them.
-
-    A surge is mixed in immediately. Waiting for persistence to fade left
-    those games with almost no mass across the 72-hour average. A positive
-    rank velocity (the place number getting worse) is dropped for a surge,
-    because that lag is the thing the player jump is meant to correct.
-    The like-ratio nudge shifts only the diffused mean, and is zero when
-    the snapshot had no votes.
-    """
-    sigma_h = SIGMA0 + SIGMA_MAX * (1.0 - math.exp(-horizon / SIGMA_TAU))
-    persist = math.exp(-horizon / PERSIST_TAU)
-    newcomer = min(NEW_CAP, NEW_BASE + NEW_SLOPE * (horizon ** NEW_POWER))
-    densities = []
-    for uid, feat, weight, rocket_mean, stale, volatility in prepared:
-        alive = survival(uid, created, now, horizon)
+    width_h = WIDTH_FLOOR + WIDTH_SPAN * (1.0 - chartmath.exp(-ahead / WIDTH_HALFLIFE))
+    stick = chartmath.exp(-ahead / STICK_HALFLIFE)
+    fresh = min(FRESH_LIMIT, FRESH_FLOOR + FRESH_SLOPE * (ahead ** FRESH_POWER))
+    rows = []
+    for uid, feat, weight, aim, stale, vol in packed:
+        alive = still_listed(uid, born, now, ahead)
         if alive <= 0.0:
-            densities.append(None)
-            continue
-        drift = feat["vel"] * VEL_TAU * (1.0 - math.exp(-horizon / VEL_TAU))
-        if weight > 0.2 and drift > 0.0:
-            drift = 0.0
-        mean = feat["rank"] + drift + feat["like_nudge"]
-        if stale:
-            mean += STALE_DRIFT * horizon
-        sigma = max(0.7, sigma_h * volatility)
-        rocket_sigma = max(3.0, ROCKET_SIGMA0 + 0.035 * horizon)
-        persist_w = persist * (1.0 - 0.9 * weight)
-        row = [0.0] * places
-        center = _persist_center(feat["rank"])
-        for place in range(1, places + 1):
-            density = persist_w * gaussian(place, center, PERSIST_SIGMA)
-            density += (1.0 - persist_w) * (1.0 - weight) * gaussian(place, mean, sigma)
-            if weight > 0.02:
-                density += (1.0 - persist_w) * weight * gaussian(place, rocket_mean, rocket_sigma)
-            row[place - 1] = alive * density
-        densities.append(row)
-    return densities, newcomer
+            rows.append(None)
+        else:
+            pace = feat["pace"] * SLOPE_MEMORY * (1.0 - chartmath.exp(-ahead / SLOPE_MEMORY))
+            if weight > 0.2 and pace > 0.0:
+                pace = 0.0
+            center = feat["seat"] + pace + feat["nudge"]
+            if stale:
+                center = center + AGED_SLIDE * ahead
+            width = max(0.7, width_h * vol)
+            jump_width = max(3.0, JUMP_WIDTH0 + 0.035 * ahead)
+            stick_w = stick * (1.0 - 0.9 * weight)
+            anchor = sticky_seat(feat["seat"])
+            line = []
+            seat = 1
+            while seat <= seats:
+                density = stick_w * bell(seat, anchor, STICK_WIDTH)
+                wander = (1.0 - stick_w) * (1.0 - weight) * bell(seat, center, width)
+                density = density + wander
+                if weight > 0.02:
+                    leap = (1.0 - stick_w) * weight * bell(seat, aim, jump_width)
+                    density = density + leap
+                line.append(alive * density)
+                seat = seat + 1
+            rows.append(line)
+    return rows, fresh
 
 
-def _mix_into(accumulated, densities, newcomer, places):
-    """Add one hour's normalized place distribution into the running mixture.
-
-    `newcomer` is held out before the densities are scaled, so games that
-    are not on the chart yet share that mass equally when the forecast is
-    scored.
-    """
-    for place_index in range(places):
+def blend_hour(bucket, rows, fresh, seats):
+    """Fold one hour into the running mixture, holding `fresh` out first."""
+    seat = 0
+    while seat < seats:
         total = 0.0
-        for row in densities:
-            if row is not None:
-                total += row[place_index]
-        if total <= 0.0:
-            continue
-        scale = (1.0 - newcomer) / total
-        for index, row in enumerate(densities):
-            if row is not None:
-                accumulated[index][place_index] += row[place_index] * scale
+        for line in rows:
+            if line is not None:
+                total = total + line[seat]
+        if total > 0.0:
+            scale = (1.0 - fresh) / total
+            index = 0
+            while index < len(rows):
+                line = rows[index]
+                if line is not None:
+                    bucket[index][seat] = bucket[index][seat] + line[seat] * scale
+                index = index + 1
+        seat = seat + 1
 
 
-def forecast(task, snaps):
-    """Horizon-averaged place probabilities and an ordered top-10 guess."""
-    times, series, created = series_and_created(snaps)
-    now = times[-1]
-    features = game_features(series, now)
-    prepared = prepare_candidates(features)
+def label_chart(by_seat, packed):
+    """Up to 100 rows a seat, naming every title on the newest chart.
 
-    win_from = parse_hours(task["window"]["from"])
-    win_until = parse_hours(task["window"]["until"])
-    slots = int(task["window"]["slots"])
-    places = int(task.get("places", PLACES))
-    slot_hours = (win_until - win_from) / slots
-    horizons = [max(0.3, win_from + (index + 0.5) * slot_hours - now) for index in range(slots)]
-
-    accumulated = [[0.0] * places for _ in prepared]
-    for horizon in horizons:
-        densities, newcomer = densities_at_horizon(prepared, created, now, horizon, places)
-        _mix_into(accumulated, densities, newcomer, places)
-
-    n_horizons = float(len(horizons))
-    by_place = [[] for _ in range(places)]
-    for index, (uid, _feat, _weight, _mean, _stale, _vol) in enumerate(prepared):
-        for place_index in range(places):
-            probability = accumulated[index][place_index] / n_horizons
-            if probability > 0.0:
-                by_place[place_index].append((uid, probability))
-
-    probabilities = _name_every_chart_game(by_place, prepared)
-    top = _top_list(probabilities, features, snaps, places)
-    return probabilities, top, task.get("output", "forecast.json")
-
-
-def _name_every_chart_game(by_place, prepared):
-    """Emit up to 100 rows per place, naming every current-chart game.
-
-    Dust below the log-score floor is dropped before the fill. Leaving it in
-    counted the game as named, then rounding deleted the row, and the game
-    went back into the residual pool and thinned the share left for newcomers.
+    Mass under the log-score floor is dropped before the fill. Keeping it
+    would mark the title as named, then rounding would delete the row and
+    the title would dilute the share left for true newcomers.
     """
-    probabilities = []
-    for place_index, rows in enumerate(by_place):
-        rows = [(uid, probability) for uid, probability in rows if probability >= MIN_P]
-        rows.sort(key=lambda item: (-item[1], item[0]))
-        mass = sum(probability for _uid, probability in rows)
+    listed = []
+    place_index = 0
+    for rows in by_seat:
+        kept = []
+        for uid, prob in rows:
+            if prob >= FLOOR_P:
+                kept.append((uid, prob))
+
+        def heavier(pair):
+            return (-pair[1], pair[0])
+
+        kept.sort(key=heavier)
+        mass = 0.0
+        for _uid, prob in kept:
+            mass = mass + prob
         if mass > 0.97:
-            scale = 0.97 / mass
-            rows = [(uid, probability * scale) for uid, probability in rows]
+            factor = 0.97 / mass
+            resized = []
+            for uid, prob in kept:
+                resized.append((uid, prob * factor))
+            kept = resized
             mass = 0.97
-        named = {uid for uid, _probability in rows}
-        for uid, _feat, _weight, _mean, _stale, _vol in prepared:
-            if len(rows) >= MAX_ROWS:
-                break
-            if uid in named:
-                continue
-            if mass + MIN_P > 0.98:
-                break
-            rows.append((uid, MIN_P))
-            mass += MIN_P
-            named.add(uid)
-        place = place_index + 1
-        for uid, probability in rows:
-            if probability >= MIN_P:
-                probabilities.append((uid, place, probability))
-    return probabilities
+        seen = set()
+        for uid, _prob in kept:
+            seen.add(uid)
+        for packed_row in packed:
+            uid = packed_row[0]
+            open_slot = len(kept) < ROW_CAP
+            fresh_id = uid not in seen
+            budget = (mass + FLOOR_P) <= 0.98
+            if open_slot and fresh_id and budget:
+                kept.append((uid, FLOOR_P))
+                mass = mass + FLOOR_P
+                seen.add(uid)
+        seat_no = place_index + 1
+        for uid, prob in kept:
+            if prob >= FLOOR_P:
+                listed.append((uid, seat_no, prob))
+        place_index = place_index + 1
+    return listed
 
 
-def _top_list(probabilities, features, snaps, places):
-    """Ten ids ordered by conditional expected place, mass as the tie-break."""
+def ordered_ten(triples, features, snapshots, seats):
+    """Ten ids by conditional expected seat, with mass breaking ties."""
     mass = {}
-    expected = {}
-    for uid, place, probability in probabilities:
-        mass[uid] = mass.get(uid, 0.0) + probability
-        expected[uid] = expected.get(uid, 0.0) + place * probability
+    expect = {}
+    for uid, seat, prob in triples:
+        mass[uid] = mass.get(uid, 0.0) + prob
+        expect[uid] = expect.get(uid, 0.0) + (seat * prob)
 
-    def order_key(uid):
+    def rank_key(uid):
         total = mass.get(uid, 0.0)
         if total <= 1e-6:
-            return (50.0, 0.0, uid)
-        return (expected[uid] / total, -total, uid)
+            missing = (50.0, 0.0, uid)
+            return missing
+        score = (expect[uid] / total, -total, uid)
+        return score
 
-    top = sorted(features, key=order_key)[:places]
-    if len(top) < places:
-        chart = sorted(snaps[-1]["up_and_coming"], key=lambda row: row["rank"])
-        for row in chart:
-            if row["universe_id"] not in top:
-                top.append(row["universe_id"])
-            if len(top) == places:
-                break
-    return top
+    chosen = sorted(features, key=rank_key)
+    chosen = list(chosen[:seats])
+    if len(chosen) < seats:
+        chart = snapshots[-1].get("up_and_coming") or []
+        chart = sorted(chart, key=lambda entry: entry["rank"])
+        for entry in chart:
+            uid = entry["universe_id"]
+            if uid not in chosen and len(chosen) < seats:
+                chosen.append(uid)
+    return chosen
 
 
-def round_probabilities(probabilities):
-    """Six-decimal probabilities, at most 100 per place, each place summing to <= 1."""
-    by_place = {}
-    for uid, place, probability in probabilities:
-        by_place.setdefault(place, []).append([uid, round(float(probability), 6)])
+def build_forecast(task, snapshots):
+    """Average the hourly seat distributions across the scored window."""
+    moments, tracks, born = build_tracks(snapshots)
+    now = moments[-1]
+    features = features_now(tracks, now)
+    packed = pack_games(features)
+    start = as_hours(task["window"]["from"])
+    stop = as_hours(task["window"]["until"])
+    slots = int(task["window"]["slots"])
+    seats = int(task.get("places", SEAT_COUNT))
+    width = (stop - start) / slots
+    ahead = []
+    cursor = 0
+    while cursor < slots:
+        mid = start + (cursor + 0.5) * width - now
+        if mid < 0.3:
+            mid = 0.3
+        ahead.append(mid)
+        cursor = cursor + 1
+    bucket = []
+    for _game in packed:
+        bucket.append([0.0] * seats)
+    for horizon in ahead:
+        rows, fresh = hour_rows(packed, born, now, horizon, seats)
+        blend_hour(bucket, rows, fresh, seats)
+    count = float(len(ahead))
+    by_seat = []
+    seat = 0
+    while seat < seats:
+        by_seat.append([])
+        seat = seat + 1
+    game_index = 0
+    for packed_row in packed:
+        uid = packed_row[0]
+        seat = 0
+        while seat < seats:
+            prob = bucket[game_index][seat] / count
+            if prob > 0.0:
+                by_seat[seat].append((uid, prob))
+            seat = seat + 1
+        game_index = game_index + 1
+    triples = label_chart(by_seat, packed)
+    top = ordered_ten(triples, features, snapshots, seats)
+    filename = task.get("output", "forecast.json")
+    return triples, top, filename
+
+
+def quantize(triples):
+    """Six decimals, at most 100 rows a seat, each seat summing to at most 1."""
+    grouped = {}
+    for uid, seat, prob in triples:
+        rounded = round(float(prob), 6)
+        grouped.setdefault(seat, []).append([uid, rounded])
     rows = []
-    for place in sorted(by_place):
-        items = [item for item in by_place[place] if item[1] >= MIN_P]
-        items.sort(key=lambda item: (-item[1], item[0]))
-        items = items[:MAX_ROWS]
-        total = sum(item[1] for item in items)
-        if total > 1.0:
+    for seat in sorted(grouped):
+        items = []
+        for item in grouped[seat]:
+            if item[1] >= FLOOR_P:
+                items.append(item)
+
+        def heavier(pair):
+            return (-pair[1], pair[0])
+
+        items.sort(key=heavier)
+        if len(items) > ROW_CAP:
+            items = items[:ROW_CAP]
+        total = 0.0
+        for item in items:
+            total = total + item[1]
+        if total > 1.0 and len(items) > 0:
             overflow = total - 1.0
             items[0][1] = round(items[0][1] - overflow, 6)
-            if items[0][1] < MIN_P:
-                items[0][1] = MIN_P
-        for uid, probability in items:
-            if probability >= MIN_P:
-                rows.append({"universe_id": int(uid), "place": int(place), "p": probability})
-    rows.sort(key=lambda row: (row["place"], -row["p"], row["universe_id"]))
+            if items[0][1] < FLOOR_P:
+                items[0][1] = FLOOR_P
+        for uid, prob in items:
+            if prob >= FLOOR_P:
+                record = {"universe_id": int(uid), "place": int(seat), "p": prob}
+                rows.append(record)
+
+    def document_order(row):
+        return (row["place"], -row["p"], row["universe_id"])
+
+    rows.sort(key=document_order)
     return rows
 
 
-def main():
-    task, snaps = load_inputs()
-    probabilities, top10, output_name = forecast(task, snaps)
-    document = {
-        "probabilities": round_probabilities(probabilities),
-        "top10": [int(uid) for uid in top10],
-    }
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    path = os.path.join(OUTPUT_DIR, output_name)
+def run():
+    task, snapshots = read_bundle()
+    triples, top, filename = build_forecast(task, snapshots)
+    names = []
+    for uid in top:
+        names.append(int(uid))
+    document = {"probabilities": quantize(triples), "top10": names}
+    chartos.makedirs(CHART_OUT, exist_ok=True)
+    path = chartos.path.join(CHART_OUT, filename)
     with open(path, "w", encoding="utf-8") as handle:
-        json.dump(document, handle, separators=(",", ":"))
-        handle.write("\n")
+        chartjson.dump(document, handle, separators=(",", ":"))
+        newline = "\n"
+        handle.write(newline)
 
 
 if __name__ == "__main__":
-    main()
+    run()
