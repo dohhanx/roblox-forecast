@@ -16,6 +16,11 @@ Every game on the latest chart is named, so that leftover is shared by games
 that are not in the history. A game with a known publish time is removed once
 it is older than 28 days.
 
+When a snapshot carries games/v1 details, cumulative visits and favorites can
+only raise the 24-hour growth signal, and a like-ratio far from 0.90 nudges
+the diffused rank. The practice archive sends none of those, so they do not
+move the practice forecast.
+
 Reads $MAKEFUN_INPUT_DIR or /input. Writes $MAKEFUN_OUTPUT_DIR or /output.
 Python 3.13, standard library only. Deterministic.
 """
@@ -64,6 +69,11 @@ MAX_AGE_HOURS = 28.0 * 24.0
 PLACES = 10
 MIN_P = 1e-4
 MAX_ROWS = 100
+# Like-ratio of 0.90 is treated as neutral. Farther away moves the diffused
+# rank by this many ranks per unit of ratio, and only with enough votes.
+LIKE_NEUTRAL = 0.90
+LIKE_SCALE = 8.0
+LIKE_MIN_VOTES = 50.0
 
 
 def parse_hours(stamp):
@@ -110,6 +120,11 @@ def weighted_slope(points, half_life):
     return covariance / variance, weight_sum
 
 
+def _is_number(value):
+    """True for a real JSON number. Booleans are ints and do not count."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _detail_map(snap):
     """universe id -> details dict, for snapshots that carried games/v1."""
     details = snap.get("details") or {}
@@ -128,18 +143,49 @@ def _detail_map(snap):
 
 def _optional_float(detail, key):
     value = detail.get(key) if isinstance(detail, dict) else None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if not _is_number(value):
         return 0.0
     return float(value)
+
+
+def _vote_pair(row, detail):
+    """(up, down) from the chart row, else from details, else missing."""
+    up = row.get("up_votes")
+    down = row.get("down_votes")
+    if _is_number(up) and _is_number(down):
+        return float(up), float(down)
+    if isinstance(detail, dict):
+        up = detail.get("up_votes")
+        down = detail.get("down_votes")
+        if _is_number(up) and _is_number(down):
+            return float(up), float(down)
+    return None
+
+
+def _like_nudge(row, detail):
+    """Ranks to add to the diffused mean. Negative is a better place.
+
+    Missing votes, which is the whole practice archive, contribute 0. A
+    like-ratio above 0.90 on at least 50 votes pulls the game up a fraction
+    of a rank; a weak ratio pushes it down.
+    """
+    pair = _vote_pair(row, detail)
+    if pair is None:
+        return 0.0
+    up, down = pair
+    total = up + down
+    if total < LIKE_MIN_VOTES:
+        return 0.0
+    return (LIKE_NEUTRAL - up / total) * LIKE_SCALE
 
 
 def series_and_created(snaps):
     """Per-game history plus publish times.
 
-    Each observation is (time, rank, players, player-rank, visits). Visits
-    stay 0 unless that snapshot's details name them. `created` is set only
-    when a snapshot carries games/v1 details: the practice archive has none,
-    and the final hourly recorder does.
+    Each observation is (time, rank, players, player-rank, visits, favorites,
+    like-nudge). Visits, favorites and the nudge stay 0 unless that snapshot
+    names them. `created` is set only when a snapshot carries games/v1
+    details: the practice archive has none, and the final hourly recorder does.
     """
     times = [parse_hours(snap["at"]) for snap in snaps]
     series = {}
@@ -161,6 +207,8 @@ def series_and_created(snaps):
                     float(row.get("playing") or 0.0),
                     float(player_rank[uid]),
                     _optional_float(detail, "visits"),
+                    _optional_float(detail, "favorites"),
+                    _like_nudge(row, detail),
                 )
             )
             if uid not in created and detail.get("created"):
@@ -172,11 +220,11 @@ def series_and_created(snaps):
 
 
 def _log_change(obs, index):
-    """Log growth per hour of observation field `index`, or None if unknown.
+    """(long growth or None, short growth) for observation field `index`.
 
     The long window is the observation nearest 24 hours back, kept only when
-    it actually falls between 8 and 40 hours ago. Cumulative visits use the
-    same window; concurrent players also report the last step.
+    it falls between 8 and 40 hours ago. Short growth is the last step.
+    Unknown fields (no positive readings) return (None, 0).
     """
     last = obs[-1]
     if last[index] <= 0.0:
@@ -200,17 +248,18 @@ def _log_change(obs, index):
 
 
 def _log_player_growth(obs):
-    """Player log-growth. Visits, when the recorder sent them, can only raise it.
+    """Player log-growth. Visits and favorites can only raise the long rate.
 
-    Visits are cumulative, so a 24-hour visit change is not a time-of-day
-    swing. The practice archive sends no visits and this leaves the player
-    signal untouched.
+    Both are cumulative, so a 24-hour change is not a time-of-day swing. The
+    practice archive sends neither, and this then returns the player signal
+    alone.
     """
-    visit_long, _visit_short = _log_change(obs, 4)
     player_long, player_short = _log_change(obs, 2)
     log_long = 0.0 if player_long is None else player_long
-    if visit_long is not None:
-        log_long = max(log_long, visit_long)
+    for field in (4, 5):
+        extra, _short = _log_change(obs, field)
+        if extra is not None:
+            log_long = max(log_long, extra)
     return player_short, log_long
 
 
@@ -222,7 +271,7 @@ def game_features(series, now):
         if abs(last[0] - now) > 1e-3:
             continue
         slope, weight = weighted_slope(
-            [(stamp, rank) for stamp, rank, _players, _player_rank, _visits in obs],
+            [(row[0], row[1]) for row in obs],
             VEL_HALF_LIFE,
         )
         shrink = weight / (weight + VEL_SHRINK)
@@ -235,6 +284,7 @@ def game_features(series, now):
             "gap": last[1] - last[3],
             "hours_on": now - obs[0][0],
             "n": len(obs),
+            "like_nudge": last[6],
         }
     return features
 
@@ -335,6 +385,8 @@ def densities_at_horizon(prepared, created, now, horizon, places):
     those games with almost no mass across the 72-hour average. A positive
     rank velocity (the place number getting worse) is dropped for a surge,
     because that lag is the thing the player jump is meant to correct.
+    The like-ratio nudge shifts only the diffused mean, and is zero when
+    the snapshot had no votes.
     """
     sigma_h = SIGMA0 + SIGMA_MAX * (1.0 - math.exp(-horizon / SIGMA_TAU))
     persist = math.exp(-horizon / PERSIST_TAU)
@@ -348,7 +400,7 @@ def densities_at_horizon(prepared, created, now, horizon, places):
         drift = feat["vel"] * VEL_TAU * (1.0 - math.exp(-horizon / VEL_TAU))
         if weight > 0.2 and drift > 0.0:
             drift = 0.0
-        mean = feat["rank"] + drift
+        mean = feat["rank"] + drift + feat["like_nudge"]
         if stale:
             mean += STALE_DRIFT * horizon
         sigma = max(0.7, sigma_h * volatility)
@@ -364,6 +416,26 @@ def densities_at_horizon(prepared, created, now, horizon, places):
             row[place - 1] = alive * density
         densities.append(row)
     return densities, newcomer
+
+
+def _mix_into(accumulated, densities, newcomer, places):
+    """Add one hour's normalized place distribution into the running mixture.
+
+    `newcomer` is held out before the densities are scaled, so games that
+    are not on the chart yet share that mass equally when the forecast is
+    scored.
+    """
+    for place_index in range(places):
+        total = 0.0
+        for row in densities:
+            if row is not None:
+                total += row[place_index]
+        if total <= 0.0:
+            continue
+        scale = (1.0 - newcomer) / total
+        for index, row in enumerate(densities):
+            if row is not None:
+                accumulated[index][place_index] += row[place_index] * scale
 
 
 def forecast(task, snaps):
@@ -383,17 +455,7 @@ def forecast(task, snaps):
     accumulated = [[0.0] * places for _ in prepared]
     for horizon in horizons:
         densities, newcomer = densities_at_horizon(prepared, created, now, horizon, places)
-        for place_index in range(places):
-            total = 0.0
-            for row in densities:
-                if row is not None:
-                    total += row[place_index]
-            if total <= 0.0:
-                continue
-            scale = (1.0 - newcomer) / total
-            for index, row in enumerate(densities):
-                if row is not None:
-                    accumulated[index][place_index] += row[place_index] * scale
+        _mix_into(accumulated, densities, newcomer, places)
 
     n_horizons = float(len(horizons))
     by_place = [[] for _ in range(places)]
